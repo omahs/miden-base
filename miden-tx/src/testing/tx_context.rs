@@ -15,7 +15,6 @@ use miden_objects::{
     notes::{Note, NoteId, NoteType},
     testing::{
         account_code::{ACCOUNT_ADD_ASSET_TO_NOTE_MAST_ROOT, ACCOUNT_CREATE_NOTE_MAST_ROOT},
-        block::{MockChain, MockChainBuilder},
         constants::{
             CONSUMED_ASSET_1_AMOUNT, CONSUMED_ASSET_2_AMOUNT, CONSUMED_ASSET_3_AMOUNT,
             NON_FUNGIBLE_ASSET_DATA_2,
@@ -33,13 +32,16 @@ use rand_chacha::ChaCha20Rng;
 use vm_processor::{AdviceInputs, ExecutionError, Felt, Process, Word};
 use winter_maybe_async::maybe_async;
 
-use super::{executor::CodeExecutor, MockHost};
+use super::{executor::CodeExecutor, mock_chain::{MockChain, MockChainBuilder}, MockHost};
 use crate::{DataStore, DataStoreError};
 
 // TRANSACTION CONTEXT
 // ================================================================================================
 
 #[derive(Debug, Clone)]
+/// Represents all needed data for executing a transaction, or arbitrary code.
+///
+/// It implements [DataStore], so transactions may be executed with [TransactionExecutor](crate::TransactionExecutor)
 pub struct TransactionContext {
     mock_chain: MockChain,
     expected_output_notes: Vec<Note>,
