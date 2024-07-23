@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
-use miden_crypto::{merkle::SimpleSmt};
+
+use miden_crypto::merkle::SimpleSmt;
 use vm_core::Felt;
 use vm_processor::Digest;
 use winter_rand_utils::{rand_array, rand_value};

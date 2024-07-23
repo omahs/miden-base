@@ -1,4 +1,4 @@
-use miden_lib::notes::create_swap_note;
+use miden_lib::{notes::create_swap_note, transaction::TransactionKernel};
 use miden_objects::{
     accounts::{
         account_id::testing::{
@@ -11,11 +11,19 @@ use miden_objects::{
     assets::{Asset, AssetVault, FungibleAsset, NonFungibleAsset, NonFungibleAssetDetails},
     crypto::rand::RpoRandomCoin,
     notes::{NoteAssets, NoteExecutionHint, NoteHeader, NoteId, NoteMetadata, NoteTag, NoteType},
-    testing::account_code::DEFAULT_AUTH_SCRIPT,
+    testing::{account::AccountBuilder, account_code::DEFAULT_AUTH_SCRIPT},
     transaction::TransactionArgs,
     Felt, ZERO,
 };
-use miden_tx::{testing::TransactionContextBuilder, TransactionExecutor};
+use miden_tx::{
+    testing::{
+        mock_chain::{Auth, MockChain},
+        TransactionContextBuilder,
+    },
+    TransactionExecutor,
+};
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 use crate::{
     get_account_with_default_account_code, get_new_pk_and_authenticator,
@@ -25,8 +33,10 @@ use crate::{
 #[test]
 fn prove_swap_script() {
     // Create assets
-    let faucet_id = AccountId::try_from(ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN).unwrap();
-    let offered_asset: Asset = FungibleAsset::new(faucet_id, 100).unwrap().into();
+    let assembler = &TransactionKernel::assembler();
+    let chain = MockChain::new();
+    let faucet = chain.create_existing_faucet(Auth::NoAuth, "POL", 100000u64);
+    let offered_asset = faucet.mint(100);
 
     let faucet_id_2 = AccountId::try_from(ACCOUNT_ID_NON_FUNGIBLE_FAUCET_ON_CHAIN).unwrap();
     let requested_asset: Asset = NonFungibleAsset::new(
@@ -36,10 +46,16 @@ fn prove_swap_script() {
     .into();
 
     // Create sender and target account
-    let sender_account_id = AccountId::try_from(ACCOUNT_ID_SENDER).unwrap();
+    let rng = ChaCha20Rng::from_entropy();
+    let (sender_account, sender_seed) = AccountBuilder::new(rng)
+        .nonce(Felt::new(1))
+        .add_asset(offered_asset)
+        .build(assembler)
+        .unwrap();
 
-    let target_account_id =
-        AccountId::try_from(ACCOUNT_ID_REGULAR_ACCOUNT_UPDATABLE_CODE_OFF_CHAIN).unwrap();
+    let (target_account, target_seed) =
+        AccountBuilder::new(rng).add_asset(requested_asset).build(assembler).unwrap();
+
     let (target_pub_key, target_falcon_auth) = get_new_pk_and_authenticator();
     let target_account = get_account_with_default_account_code(
         target_account_id,
@@ -66,7 +82,7 @@ fn prove_swap_script() {
 
     let mut executor =
         TransactionExecutor::new(tx_context.clone(), Some(target_falcon_auth.clone()));
-    executor.load_account(target_account_id).unwrap();
+    executor.load_account(target_account.id()).unwrap();
 
     let block_ref = tx_context.tx_inputs().block_header().block_num();
     let note_ids = tx_context
@@ -82,7 +98,7 @@ fn prove_swap_script() {
     let tx_args_target = TransactionArgs::with_tx_script(tx_script_target);
 
     let executed_transaction = executor
-        .execute_transaction(target_account_id, block_ref, &note_ids, tx_args_target)
+        .execute_transaction(target_account.id(), block_ref, &note_ids, tx_args_target)
         .expect("Transaction consuming swap note failed");
 
     // target account vault delta
@@ -102,8 +118,9 @@ fn prove_swap_script() {
 
     // Check if the output `Note` is what we expect
     let recipient = payback_note.recipient().clone();
-    let tag = NoteTag::from_account_id(sender_account_id, NoteExecutionHint::Local).unwrap();
-    let note_metadata = NoteMetadata::new(target_account_id, NoteType::Private, tag, ZERO).unwrap();
+    let tag = NoteTag::from_account_id(sender_account.id(), NoteExecutionHint::Local).unwrap();
+    let note_metadata =
+        NoteMetadata::new(target_account.id(), NoteType::Private, tag, ZERO).unwrap();
     let assets = NoteAssets::new(vec![requested_asset]).unwrap();
     let note_id = NoteId::new(recipient.digest(), assets.commitment());
 
