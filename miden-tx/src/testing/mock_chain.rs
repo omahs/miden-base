@@ -1,22 +1,17 @@
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::fmt;
 
-use miden_lib::{
-    notes::create_p2id_note,
-    transaction::TransactionKernel,
-    utils::{Serializable},
-};
+use miden_lib::{notes::create_p2id_note, transaction::TransactionKernel, utils::Serializable};
 use miden_objects::{
     accounts::{
-        delta::AccountUpdateDetails, Account, AccountId, AccountType, AuthSecretKey, SlotItem,
+        delta::AccountUpdateDetails, Account, AccountDelta, AccountId, AccountType,
+        AuthSecretKey, SlotItem,
     },
     assets::{Asset, FungibleAsset, TokenSymbol},
     block::{Block, BlockAccountUpdate, BlockNoteIndex, BlockNoteTree, NoteBatch},
-    crypto::{
-        merkle::{Mmr, MmrError, PartialMmr, Smt},
-    },
+    crypto::merkle::{Mmr, MmrError, PartialMmr, Smt},
     notes::{Note, NoteId, NoteInclusionProof, NoteType, Nullifier},
-    testing::account::AccountBuilder,
+    testing::account::{AccountBuilder},
     transaction::{
         ChainMmr, ExecutedTransaction, InputNote, InputNotes, OutputNote, ToInputNoteCommitments,
         TransactionId, TransactionInputs,
@@ -31,15 +26,17 @@ use vm_processor::{
 };
 
 use super::TransactionContextBuilder;
-use crate::auth::BasicAuthenticator;
+use crate::auth::{BasicAuthenticator};
 
 /// Initial timestamp value
 const TIMESTAMP_START: u32 = 1693348223;
 /// Timestamp of timestamp on each new block
 const TIMESTAMP_STEP: u32 = 10;
 
+pub type MockAuthenticator = BasicAuthenticator<StdRng>;
+
 /// Represents a fungible faucet that exists on the MockChain
-struct MockFungibleFaucet(Account);
+pub struct MockFungibleFaucet(Account);
 
 impl MockFungibleFaucet {
     pub fn account(&self) -> &Account {
@@ -48,6 +45,40 @@ impl MockFungibleFaucet {
 
     pub fn mint(&self, amount: u64) -> Asset {
         FungibleAsset::new(self.0.id(), amount).unwrap().into()
+    }
+}
+
+/// Represents a fungible faucet that exists on the MockChain
+#[derive(Clone, Debug)]
+struct MockAccount {
+    account: Account,
+    seed: Option<Word>,
+    authenticator: Option<BasicAuthenticator<StdRng>>,
+}
+
+impl MockAccount {
+    pub fn new(
+        account: Account,
+        seed: Option<Word>,
+        authenticator: Option<BasicAuthenticator<StdRng>>,
+    ) -> Self {
+        MockAccount { account, seed, authenticator }
+    }
+
+    pub fn apply_delta(&mut self, delta: &AccountDelta) {
+        self.account.apply_delta(delta);
+    }
+
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
+    pub fn seed(&self) -> Option<&Word> {
+        self.seed.as_ref()
+    }
+
+    pub fn authenticator(&self) -> &Option<BasicAuthenticator<StdRng>> {
+        &self.authenticator
     }
 }
 
@@ -123,8 +154,8 @@ pub struct MockChain {
     /// NoteID |-> InputNote mapping to simplify transaction inputs retrieval
     available_notes: BTreeMap<NoteId, InputNote>,
 
-    /// NoteID |-> InputNote mapping to simplify transaction inputs retrieval
-    available_accounts: BTreeMap<AccountId, (Account, Option<Word>)>,
+    /// AccountId |-> Account mapping to simplify transaction creation
+    available_accounts: BTreeMap<AccountId, MockAccount>,
 
     removed_notes: Vec<NoteId>,
 }
@@ -177,10 +208,7 @@ impl MockChain {
         account.apply_delta(transaction.account_delta()).unwrap();
 
         // disregard private accounts, so it's easier to retrieve data
-        let account_update_details = match account.is_new() {
-            true => AccountUpdateDetails::New(account.clone()),
-            false => AccountUpdateDetails::Delta(transaction.account_delta().clone()),
-        };
+        let account_update_details = AccountUpdateDetails::New(account.clone());
 
         let block_account_update = BlockAccountUpdate::new(
             transaction.account_id(),
@@ -238,28 +266,17 @@ impl MockChain {
         self.pending_objects.created_nullifiers.push(nullifier);
     }
 
-    /// Add a new [Account] to the list of pending objects.
-    /// A block has to be created to finalize the new entity.
-    pub fn add_account(&mut self, account: Account, _seed: Option<Word>) {
-        self.pending_objects.updated_accounts.push(BlockAccountUpdate::new(
-            account.id(),
-            account.hash(),
-            AccountUpdateDetails::New(account),
-            vec![],
-        ));
-    }
-
-    pub fn create_new_wallet(&mut self, auth_method: Auth) -> Account {
+    pub fn add_new_wallet(&mut self, auth_method: Auth) -> Account {
         let account_builder = AccountBuilder::new(ChaCha20Rng::from_entropy()).nonce(Felt::ZERO);
-        self.create_wallet(auth_method, account_builder)
+        self.add_from_account_builder(auth_method, account_builder)
     }
 
-    pub fn create_existing_wallet(&mut self, auth_method: Auth) -> Account {
+    pub fn add_existing_wallet(&mut self, auth_method: Auth) -> Account {
         let account_builder = AccountBuilder::new(ChaCha20Rng::from_entropy()).nonce(Felt::ONE);
-        self.create_wallet(auth_method, account_builder)
+        self.add_from_account_builder(auth_method, account_builder)
     }
 
-    pub fn create_new_faucet(
+    pub fn add_new_faucet(
         &mut self,
         auth_method: Auth,
         token_symbol: &str,
@@ -278,10 +295,13 @@ impl MockChain {
             .nonce(Felt::ZERO)
             .account_type(AccountType::FungibleFaucet)
             .add_storage_item(faucet_metadata);
-        MockFungibleFaucet(self.create_wallet(auth_method, account_builder))
+
+        let account = self.add_from_account_builder(auth_method, account_builder);
+
+        MockFungibleFaucet(account)
     }
 
-    pub fn create_existing_faucet(
+    pub fn add_existing_faucet(
         &mut self,
         auth_method: Auth,
         token_symbol: &str,
@@ -300,10 +320,12 @@ impl MockChain {
             .nonce(Felt::ONE)
             .account_type(AccountType::FungibleFaucet)
             .add_storage_item(faucet_metadata);
-        MockFungibleFaucet(self.create_wallet(auth_method, account_builder))
+        MockFungibleFaucet(self.add_from_account_builder(auth_method, account_builder))
     }
 
-    fn create_wallet(
+    /// Add a new [Account] from an [AccountBuilder] to the list of pending objects.
+    /// A block has to be created to finalize the new entity.
+    pub fn add_from_account_builder(
         &mut self,
         auth_method: Auth,
         account_builder: AccountBuilder<ChaCha20Rng>,
@@ -326,14 +348,29 @@ impl MockChain {
         };
 
         let seed = account.is_new().then_some(seed);
-        self.available_accounts.insert(account.id(), (account.clone(), seed));
+        self.available_accounts
+            .insert(account.id(), MockAccount::new(account.clone(), seed, authenticator));
+        self.add_account(account.clone());
 
         account
     }
 
-    pub fn execute_tx(&self, account_id: AccountId) -> TransactionContextBuilder {
-        let (account, _) = self.available_accounts.get(&account_id).unwrap();
-        TransactionContextBuilder::new(account.clone())
+    /// Add a new [Account] to the list of pending objects.
+    /// A block has to be created to finalize the new entity.
+    pub fn add_account(&mut self, account: Account) {
+        self.pending_objects.updated_accounts.push(BlockAccountUpdate::new(
+            account.id(),
+            account.hash(),
+            AccountUpdateDetails::New(account),
+            vec![],
+        ));
+    }
+
+    pub fn build_tx_context(&self, account_id: AccountId) -> TransactionContextBuilder {
+        let mock_account = self.available_accounts.get(&account_id).unwrap();
+
+        TransactionContextBuilder::new(mock_account.account().clone())
+            .authenticator(mock_account.authenticator().clone())
     }
 
     pub fn get_transaction_inputs(
@@ -391,6 +428,21 @@ impl MockChain {
 
         for update in self.pending_objects.updated_accounts.iter() {
             self.accounts.insert(update.account_id().into(), *update.new_state_hash());
+
+            if let Some(mock_account) = self.available_accounts.get(&update.account_id()) {
+                let account = match update.details() {
+                    AccountUpdateDetails::New(acc) => acc.clone(),
+                    _ => panic!("The mockchain should have full account details"),
+                };
+                self.available_accounts.insert(
+                    update.account_id(),
+                    MockAccount::new(
+                        account,
+                        mock_account.seed,
+                        mock_account.authenticator.clone(),
+                    ),
+                );
+            }
         }
 
         // TODO:
@@ -546,7 +598,7 @@ impl MockChainBuilder {
     pub fn build(self) -> MockChain {
         let mut chain = MockChain::new();
         for account in self.accounts {
-            chain.add_account(account, None);
+            chain.add_account(account);
         }
 
         for note in self.notes {

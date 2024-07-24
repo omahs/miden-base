@@ -1,11 +1,12 @@
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
 
 use miden_lib::transaction::{ToTransactionKernelInputs, TransactionKernel};
 use miden_objects::{
     accounts::{
         account_id::testing::{
-            ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN_1, ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN_2,
-            ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN_3, ACCOUNT_ID_NON_FUNGIBLE_FAUCET_ON_CHAIN,
+            ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN_1,
+            ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN_2, ACCOUNT_ID_FUNGIBLE_FAUCET_ON_CHAIN_3,
+            ACCOUNT_ID_NON_FUNGIBLE_FAUCET_ON_CHAIN,
             ACCOUNT_ID_REGULAR_ACCOUNT_UPDATABLE_CODE_ON_CHAIN, ACCOUNT_ID_SENDER,
         },
         Account, AccountId,
@@ -24,20 +25,24 @@ use miden_objects::{
         storage::prepare_assets,
     },
     transaction::{
-        InputNote, InputNotes, OutputNote, PreparedTransaction, TransactionArgs, TransactionInputs,
+        ExecutedTransaction, InputNote, InputNotes, OutputNote, PreparedTransaction,
+        TransactionArgs, TransactionInputs, TransactionScript,
     },
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use vm_processor::{AdviceInputs, ExecutionError, Felt, Process, Word};
+use vm_processor::{AdviceInputs, AdviceMap, ExecutionError, Felt, Process, Word};
 use winter_maybe_async::maybe_async;
 
 use super::{
     executor::CodeExecutor,
-    mock_chain::{MockChain, MockChainBuilder},
+    mock_chain::{MockAuthenticator, MockChain, MockChainBuilder},
     MockHost,
 };
-use crate::{DataStore, DataStoreError};
+use crate::{
+    DataStore, DataStoreError, TransactionExecutor,
+    TransactionExecutorError,
+};
 
 // TRANSACTION CONTEXT
 // ================================================================================================
@@ -52,9 +57,11 @@ pub struct TransactionContext {
     tx_args: TransactionArgs,
     tx_inputs: TransactionInputs,
     advice_inputs: AdviceInputs,
+    authenticator: Option<MockAuthenticator>,
 }
 
 impl TransactionContext {
+    /// Executes arbitrary code
     pub fn execute_code(&self, code: &str) -> Result<Process<MockHost>, ExecutionError> {
         let assembler = TransactionKernel::assembler().with_debug_mode(true);
         let program = assembler.compile(code).unwrap();
@@ -65,6 +72,19 @@ impl TransactionContext {
         CodeExecutor::new(MockHost::new(tx.account().into(), advice_inputs))
             .stack_inputs(stack_inputs)
             .run(code)
+    }
+
+    /// Executes the transaction through a [TransactionExecutor]
+    pub fn execute(self) -> Result<ExecutedTransaction, TransactionExecutorError> {
+        let mock_data_store = MockDataStore::new(self.tx_inputs.clone());
+
+        let account_id = self.account().id();
+        let block_num = mock_data_store.tx_inputs.block_header().block_num();
+        let tx_executor =
+            TransactionExecutor::new(mock_data_store, self.authenticator.map(Rc::new));
+        let notes: Vec<NoteId> = self.tx_inputs.input_notes().into_iter().map(|n| n.id()).collect();
+
+        tx_executor.execute_transaction(account_id, block_num, &notes, self.tx_args)
     }
 
     pub fn account(&self) -> &Account {
@@ -125,26 +145,30 @@ pub struct TransactionContextBuilder {
     assembler: Assembler,
     account: Account,
     account_seed: Option<Word>,
-    advice_inputs: Option<AdviceInputs>,
+    advice_map: Option<AdviceMap>,
+    advice_inputs: AdviceInputs,
+    authenticator: Option<MockAuthenticator>,
     input_notes: Vec<Note>,
     expected_output_notes: Vec<Note>,
-    tx_args: TransactionArgs,
+    tx_script: Option<TransactionScript>,
+    note_args: BTreeMap<NoteId, Word>,
     rng: ChaCha20Rng,
 }
 
 impl TransactionContextBuilder {
     pub fn new(account: Account) -> Self {
-        let tx_args = TransactionArgs::default();
-
         Self {
             assembler: TransactionKernel::assembler().with_debug_mode(true),
             account,
             account_seed: None,
             input_notes: Vec::new(),
             expected_output_notes: Vec::new(),
-            tx_args,
-            advice_inputs: None,
+            advice_map: None,
             rng: ChaCha20Rng::from_seed([0_u8; 32]),
+            tx_script: None,
+            authenticator: None,
+            advice_inputs: Default::default(),
+            note_args: BTreeMap::new(),
         }
     }
 
@@ -157,11 +181,14 @@ impl TransactionContextBuilder {
             assembler,
             account,
             account_seed: None,
+            authenticator: None,
             input_notes: Vec::new(),
             expected_output_notes: Vec::new(),
-            tx_args: TransactionArgs::default(),
-            advice_inputs: None,
+            advice_map: None,
+            advice_inputs: Default::default(),
             rng: ChaCha20Rng::from_seed([0_u8; 32]),
+            tx_script: None,
+            note_args: BTreeMap::new(),
         }
     }
 
@@ -173,11 +200,14 @@ impl TransactionContextBuilder {
             assembler,
             account,
             account_seed: None,
+            authenticator: None,
             input_notes: Vec::new(),
             expected_output_notes: Vec::new(),
-            tx_args: TransactionArgs::default(),
-            advice_inputs: None,
+            advice_inputs: Default::default(),
+            advice_map: None,
             rng: ChaCha20Rng::from_seed([0_u8; 32]),
+            tx_script: None,
+            note_args: BTreeMap::new(),
         }
     }
 
@@ -190,11 +220,14 @@ impl TransactionContextBuilder {
             assembler,
             account,
             account_seed: None,
+            authenticator: None,
             input_notes: Vec::new(),
             expected_output_notes: Vec::new(),
-            tx_args: TransactionArgs::default(),
-            advice_inputs: None,
+            advice_map: None,
+            advice_inputs: Default::default(),
             rng: ChaCha20Rng::from_seed([0_u8; 32]),
+            tx_script: None,
+            note_args: BTreeMap::new(),
         }
     }
 
@@ -204,12 +237,22 @@ impl TransactionContextBuilder {
     }
 
     pub fn advice_inputs(mut self, advice_inputs: AdviceInputs) -> Self {
-        self.advice_inputs = Some(advice_inputs);
+        self.advice_inputs = advice_inputs;
+        self
+    }
+
+    pub fn authenticator(mut self, authenticator: Option<MockAuthenticator>) -> Self {
+        self.authenticator = authenticator;
         self
     }
 
     pub fn input_notes(mut self, input_notes: Vec<Note>) -> Self {
         self.input_notes.extend(input_notes);
+        self
+    }
+
+    pub fn tx_script(mut self, tx_script: TransactionScript) -> Self {
+        self.tx_script = Some(tx_script);
         self
     }
 
@@ -589,9 +632,15 @@ impl TransactionContextBuilder {
         self.input_notes(vec![input_note1, input_note2, input_note4])
     }
 
-    pub fn build(mut self) -> TransactionContext {
+    pub fn build(self) -> TransactionContext {
         let mut mock_chain = MockChainBuilder::new().notes(self.input_notes.clone()).build();
         mock_chain.seal_block(None);
+
+        let mut tx_args = TransactionArgs::new(
+            self.tx_script,
+            Some(self.note_args),
+            self.advice_map.unwrap_or_default(),
+        );
 
         let input_note_ids: Vec<NoteId> =
             mock_chain.available_notes().iter().map(|n| n.id()).collect();
@@ -602,14 +651,46 @@ impl TransactionContextBuilder {
             &input_note_ids,
         );
 
-        self.tx_args.extend_expected_output_notes(self.expected_output_notes.clone());
+        tx_args.extend_expected_output_notes(self.expected_output_notes.clone());
 
         TransactionContext {
             mock_chain,
             expected_output_notes: self.expected_output_notes,
-            tx_args: self.tx_args,
+            tx_args,
             tx_inputs,
-            advice_inputs: self.advice_inputs.unwrap_or_default(),
+            authenticator: self.authenticator,
+            advice_inputs: self.advice_inputs,
         }
+    }
+}
+
+struct MockDataStore {
+    tx_inputs: TransactionInputs,
+}
+
+impl MockDataStore {
+    fn new(tx_inputs: TransactionInputs) -> Self {
+        MockDataStore { tx_inputs }
+    }
+}
+
+#[maybe_async]
+impl DataStore for MockDataStore {
+    fn get_transaction_inputs(
+        &self,
+        account_id: AccountId,
+        block_num: u32,
+        notes: &[NoteId],
+    ) -> Result<TransactionInputs, DataStoreError> {
+        assert_eq!(account_id, self.tx_inputs.account().id());
+        assert_eq!(block_num, self.tx_inputs.block_header().block_num());
+        assert_eq!(notes.len(), self.tx_inputs.input_notes().num_notes());
+
+        Ok(self.tx_inputs.clone())
+    }
+
+    fn get_account_code(&self, account_id: AccountId) -> Result<ModuleAst, DataStoreError> {
+        assert_eq!(account_id, self.tx_inputs.account().id());
+        Ok(self.tx_inputs.account().code().module().clone())
     }
 }
